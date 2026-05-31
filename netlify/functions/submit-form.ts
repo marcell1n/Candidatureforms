@@ -1,89 +1,113 @@
-// netlify/functions/submit-form.ts
+import { setDefaultResultOrder } from "dns";
+setDefaultResultOrder("ipv4first");
+
 import { Handler, HandlerEvent } from "@netlify/functions";
-import Airtable from "airtable";
-import { createHash, createHmac } from "crypto";
+import * as https from "https";
 
-// ---------- Helpers Cloudinary ----------
-
-/**
- * Génère une signature pour l'upload signé Cloudinary.
- * Cloudinary exige de signer les paramètres pour sécuriser l'upload.
- */
-function generateCloudinarySignature(
-  params: Record<string, string>,
-  apiSecret: string
-): string {
-  // Trier les paramètres alphabétiquement et les concaténer
-  const sortedParams = Object.keys(params)
-    .sort()
-    .map((key) => `${key}=${params[key]}`)
-    .join("&");
-
-  // Créer la signature SHA-256
-  return createHash("sha256")
-    .update(sortedParams + apiSecret)
-    .digest("hex");
-}
-
-/**
- * Upload un fichier (en base64) vers Cloudinary et retourne l'URL sécurisée.
- * On retourne aussi l'URL de prévisualisation PDF/image pour Airtable.
- */
 async function uploadToCloudinary(
   fileBase64: string,
-  fileName: string,
   folder: string
-): Promise<{ secureUrl: string; previewUrl: string }> {
+): Promise<string> {
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME!;
-  const apiKey = process.env.CLOUDINARY_API_KEY!;
-  const apiSecret = process.env.CLOUDINARY_API_SECRET!;
-  const timestamp = Math.round(Date.now() / 1000).toString();
 
-  const params: Record<string, string> = {
-    folder,
-    public_id: `${folder}/${fileName}_${timestamp}`,
-    timestamp,
-  };
+  const boundary = `----FormBoundary${Date.now()}`;
+  const CRLF = "\r\n";
 
-  const signature = generateCloudinarySignature(params, apiSecret);
+  const addField = (name: string, value: string): string =>
+    `--${boundary}${CRLF}Content-Disposition: form-data; name="${name}"${CRLF}${CRLF}${value}${CRLF}`;
 
-  // Construire le FormData pour l'API Cloudinary
-  const formData = new FormData();
-  formData.append("file", fileBase64); // base64 avec prefix data:...
-  formData.append("api_key", apiKey);
-  formData.append("timestamp", timestamp);
-  formData.append("signature", signature);
-  Object.entries(params).forEach(([k, v]) => formData.append(k, v));
+  let bodyStr = "";
+  bodyStr += addField("file", fileBase64);
+  bodyStr += addField("upload_preset", "candidatures_public"); // preset non signé
+  bodyStr += addField("folder", folder);
+  bodyStr += `--${boundary}--${CRLF}`;
 
-  const response = await fetch(
-    `https://api.cloudinary.com/v1_1/${cloudName}/auto/upload`,
-    { method: "POST", body: formData }
-  );
+  const bodyBuffer = Buffer.from(bodyStr, "utf-8");
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Cloudinary upload failed: ${err}`);
+  const responseData = await new Promise<string>((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: "api.cloudinary.com",
+        path: `/v1_1/${cloudName}/raw/upload`,
+        method: "POST",
+        headers: {
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+          "Content-Length": bodyBuffer.length,
+        },
+        family: 4,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => resolve(data));
+      }
+    );
+    req.on("error", reject);
+    req.write(bodyBuffer);
+    req.end();
+  });
+
+  const data = JSON.parse(responseData);
+  console.log("Cloudinary response:", JSON.stringify(data, null, 2));
+
+  if (data.error) {
+    throw new Error(`Cloudinary error: ${data.error.message}`);
   }
 
-  const data = await response.json();
-
-  // Pour les PDFs, Cloudinary génère une image de preview avec /image/upload + .jpg
-  const previewUrl = data.resource_type === "raw"
-    ? data.secure_url.replace("/raw/upload/", "/image/upload/").replace(/\.[^.]+$/, ".jpg")
-    : data.secure_url;
-
-  return { secureUrl: data.secure_url, previewUrl };
+  return data.secure_url;
 }
 
-// ---------- Handler principal ----------
+type AirtableValue = string | { url: string }[];
+type AirtableFields = Record<string, AirtableValue>;
+
+async function saveToAirtable(fields: AirtableFields): Promise<void> {
+  const token = process.env.AIRTABLE_TOKEN!;
+  const baseId = process.env.AIRTABLE_BASE_ID!;
+  const tableName = process.env.AIRTABLE_TABLE_NAME!;
+
+  const payload = JSON.stringify({ records: [{ fields }] });
+
+  await new Promise<void>((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: "api.airtable.com",
+        path: `/v0/${baseId}/${encodeURIComponent(tableName)}`,
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+        family: 4,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          const parsed = JSON.parse(data);
+          if (parsed.error) {
+            reject(
+              new Error(
+                `Airtable error: ${parsed.error.message} (${parsed.error.type})`
+              )
+            );
+          } else {
+            resolve();
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.write(payload);
+    req.end();
+  });
+}
 
 const handler: Handler = async (event: HandlerEvent) => {
-  // Accepter uniquement les requêtes POST
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
 
-  // Headers CORS pour que votre front puisse appeler cette fonction
   const headers = {
     "Access-Control-Allow-Origin": "*",
     "Content-Type": "application/json",
@@ -91,6 +115,13 @@ const handler: Handler = async (event: HandlerEvent) => {
 
   try {
     const body = JSON.parse(event.body || "{}");
+    // Ajoutez ces lignes juste après
+console.log("=== Données reçues ===");
+console.log("cvName:", body.cvName);
+console.log("cvBase64 présent:", !!body.cvBase64);
+console.log("cvBase64 longueur:", body.cvBase64?.length || 0);
+console.log("diplomeName:", body.diplomeName);
+console.log("diplomeBase64 présent:", !!body.diplomeBase64)
 
     const {
       nomComplet,
@@ -99,63 +130,49 @@ const handler: Handler = async (event: HandlerEvent) => {
       dateNaissance,
       sexe,
       nationalite,
-      domainesCompetence, // tableau de strings
+      domainesCompetence,
       motivation,
-      cvBase64,       // fichier encodé en base64
+      cvBase64,
       cvName,
       diplomeBase64,
       diplomeName,
     } = body;
 
-    // --- Upload des fichiers sur Cloudinary ---
     let cvUrl = "";
-    let cvPreviewUrl = "";
     let diplomeUrl = "";
-    let diplomePreviewUrl = "";
 
     if (cvBase64 && cvName) {
-      const result = await uploadToCloudinary(cvBase64, cvName, "candidatures/cv");
-      cvUrl = result.secureUrl;
-      cvPreviewUrl = result.previewUrl;
+      cvUrl = await uploadToCloudinary(cvBase64, "candidatures/cv");
+      console.log("CV URL:", cvUrl);
     }
 
     if (diplomeBase64 && diplomeName) {
-      const result = await uploadToCloudinary(diplomeBase64, diplomeName, "candidatures/diplomes");
-      diplomeUrl = result.secureUrl;
-      diplomePreviewUrl = result.previewUrl;
+      diplomeUrl = await uploadToCloudinary(diplomeBase64, "candidatures/diplomes");
+      console.log("Diplome URL:", diplomeUrl);
     }
 
-    // --- Enregistrement dans Airtable ---
-    const base = new Airtable({ apiKey: process.env.AIRTABLE_TOKEN }).base(
-      process.env.AIRTABLE_BASE_ID!
-    );
-
-    await base(process.env.AIRTABLE_TABLE_NAME!).create([
-      {
-        fields: {
-          "Nom complet": nomComplet,
-          "Email": email,
-          "Téléphone": telephone,
-          "Date de naissance": dateNaissance,
-          "Sexe": sexe,
-          "Nationalité": nationalite,
-          "Domaines de compétence": Array.isArray(domainesCompetence)
-            ? domainesCompetence.join(", ")
-            : domainesCompetence,
-          "CV": cvUrl,
-          "Diplôme": diplomeUrl,
-          "Motivation": motivation,
-          // URLs de prévisualisation pour voir les fichiers directement dans Airtable
-          "CV Preview": cvPreviewUrl,
-          "Diplôme Preview": diplomePreviewUrl,
-        },
-      },
-    ]);
+    await saveToAirtable({
+      "Nom complet": nomComplet,
+      "Email": email,
+      "Telephone": telephone,
+      "Date de naissance": dateNaissance,
+      "Sexe": sexe,
+      "Nationalite": nationalite,
+      "domainesCompetence": Array.isArray(domainesCompetence)
+        ? domainesCompetence.join(", ")
+        : domainesCompetence,
+      "CV": cvUrl ? [{ url: cvUrl }] : [],
+      "Diplome": diplomeUrl ? [{ url: diplomeUrl }] : [],
+      "Motivation": motivation,
+    });
 
     return {
       statusCode: 200,
       headers,
-      body: JSON.stringify({ success: true, message: "Candidature envoyée avec succès !" }),
+      body: JSON.stringify({
+        success: true,
+        message: "Candidature envoyée avec succès !",
+      }),
     };
   } catch (error) {
     console.error("Erreur:", error);
@@ -164,7 +181,7 @@ const handler: Handler = async (event: HandlerEvent) => {
       headers,
       body: JSON.stringify({
         success: false,
-        message: "Une erreur est survenue. Veuillez réessayer.",
+        message: (error as Error).message,
       }),
     };
   }
